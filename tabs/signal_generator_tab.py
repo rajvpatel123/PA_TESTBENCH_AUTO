@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from utils.logger import get_logger
 from utils.freq_entry import FreqEntry
+from utils.visa_helper import find_driver
 
 _logger = get_logger(__name__)
 
@@ -14,8 +15,6 @@ WAVEFORM_EXTS    = {".wv", ".iq", ".bin", ".csv"}
 
 class SignalGeneratorTab(ttk.Frame):
 
-    DRIVER_NAME = "RS_SMBV100B"
-
     def __init__(self, parent, driver_registry: dict):
         super().__init__(parent)
         self._registry = driver_registry
@@ -25,17 +24,18 @@ class SignalGeneratorTab(ttk.Frame):
         self._registry = registry
 
     def _get_driver(self):
-        drv = self._registry.get(self.DRIVER_NAME)
+        """Find the signal generator using role-based fuzzy lookup."""
+        drv = find_driver(self._registry, role="siggen")
         if drv is None:
             messagebox.showerror(
                 "Not Connected",
-                f"{self.DRIVER_NAME} not connected.\n"
-                "Go to Device Manager and click Connect All.")
+                "No Signal Generator found in auto-discovered instruments.\n"
+                "Ensure the R&S SMBV100B (or compatible) is powered on and connected via VISA.")
         return drv
 
     # ── UI ──────────────────────────────────────────────────────
     def _build_ui(self):
-        ttk.Label(self, text="Signal Generator - R&S SMBV100B",
+        ttk.Label(self, text="Signal Generator",
                   font=("Segoe UI", 14, "bold")).pack(pady=10)
 
         main = ttk.Frame(self)
@@ -102,7 +102,6 @@ class SignalGeneratorTab(ttk.Frame):
         right = ttk.LabelFrame(parent, text="Waveform Management")
         right.pack(side="right", fill="both", expand=True)
 
-        # ── Upload from PC ─────────────────────────────────────
         upload_lf = ttk.LabelFrame(right, text="Upload from This PC")
         upload_lf.pack(fill="x", padx=8, pady=(6, 4))
 
@@ -117,8 +116,7 @@ class SignalGeneratorTab(ttk.Frame):
         ttk.Button(upload_row, text="Browse…",
                    command=self._upload_browse).pack(side="left", padx=(0, 4))
         ttk.Button(upload_row, text="Upload to Instrument",
-                   command=self._upload_from_pc,
-                   style="Primary.TButton").pack(side="left")
+                   command=self._upload_from_pc).pack(side="left")
 
         self._upload_dest_row = ttk.Frame(upload_lf)
         self._upload_dest_row.pack(fill="x", padx=8, pady=(0, 6))
@@ -129,7 +127,6 @@ class SignalGeneratorTab(ttk.Frame):
                   textvariable=self._upload_dest_var,
                   width=26).pack(side="left")
 
-        # ── Instrument file browser ─────────────────────────────
         fb_lf = ttk.LabelFrame(right, text="Browse Instrument Files (via VISA)")
         fb_lf.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         fb_lf.rowconfigure(1, weight=1)
@@ -173,14 +170,12 @@ class SignalGeneratorTab(ttk.Frame):
         fb_btn = ttk.Frame(fb_lf)
         fb_btn.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 4))
         ttk.Button(fb_btn, text="Set as Active Waveform",
-                   command=self._fb_set_active,
-                   style="Primary.TButton").pack(side="left", padx=(0, 4))
+                   command=self._fb_set_active).pack(side="left", padx=(0, 4))
 
         self._fb_selected_path: str = ""
         self._fb_selected_lbl = ttk.Label(fb_lf, text="Selected: (none)", foreground="gray")
         self._fb_selected_lbl.grid(row=3, column=0, sticky="w", padx=6, pady=(0, 4))
 
-        # ── Waveforms on device ────────────────────────────────
         dev_lf = ttk.LabelFrame(right, text="Waveforms on Device (ARB Catalogue)")
         dev_lf.pack(fill="x", padx=8, pady=(0, 6))
 
@@ -209,30 +204,21 @@ class SignalGeneratorTab(ttk.Frame):
             self._upload_path_var.set(os.path.normpath(path))
 
     def _upload_from_pc(self):
-        """Upload a local PC file to the instrument via MMEM:DATA."""
         local_path = self._upload_path_var.get().strip()
         if not local_path or not os.path.isfile(local_path):
             messagebox.showwarning(
                 "No File", "Click Browse… to pick a file from this PC first.")
             return
-
         drv = self._get_driver()
         if drv is None:
             return
-
         dest_folder = self._upload_dest_var.get().strip().rstrip("/")
         filename    = os.path.basename(local_path)
         dest_path   = f"{dest_folder}/{filename}"
-
         try:
-            # Use the driver's existing upload_waveform but temporarily
-            # override its dest path by passing a patched call.
-            # The driver already handles the IEEE 488.2 binary block transfer.
             drv.upload_waveform(local_path, dest_override=dest_path)
         except TypeError:
-            # Older driver signature without dest_override — fall back
             drv.upload_waveform(local_path)
-
         self.status_lbl.config(
             text=f"Status: Uploaded {filename} → {dest_path}",
             foreground="green")
@@ -241,16 +227,15 @@ class SignalGeneratorTab(ttk.Frame):
         self._fb_populate_tree()
 
     # ── Instrument file browser logic ───────────────────────────
-    def _mmem_cat(self, path: str) -> list[dict]:
-        drv = self._registry.get(self.DRIVER_NAME)
-        if drv is None or drv._inst is None:
+    def _mmem_cat(self, path: str) -> list:
+        drv = find_driver(self._registry, role="siggen")
+        if drv is None or not hasattr(drv, "_inst") or drv._inst is None:
             return []
         try:
             raw = drv._inst.query(f"MMEM:CAT? '{path}'").strip()
         except Exception as e:
             _logger.warning(f"MMEM:CAT? '{path}' failed: {e}")
             return []
-
         entries = []
         parts   = raw.split(",")
         i = 2
@@ -271,10 +256,10 @@ class SignalGeneratorTab(ttk.Frame):
         if not root:
             return
         self._fb_tree.delete(*self._fb_tree.get_children())
-        drv = self._registry.get(self.DRIVER_NAME)
+        drv = find_driver(self._registry, role="siggen")
         if drv is None:
             self._fb_tree.insert("", "end",
-                                  text="⚠  Instrument not connected — connect first",
+                                  text="⚠  Signal generator not connected — connect first",
                                   values=("",))
             return
         self._fb_insert_level("", root)
@@ -286,19 +271,16 @@ class SignalGeneratorTab(ttk.Frame):
                                   text="(empty or inaccessible)",
                                   values=("",), tags=("placeholder",))
             return
-
         folders = [e for e in entries if e["type"] == "DIR"]
         files   = [e for e in entries
                    if e["type"] != "DIR"
                    and any(e["name"].lower().endswith(x) for x in WAVEFORM_EXTS)]
-
         for folder in sorted(folders, key=lambda e: e["name"].lower()):
             full = f"{path.rstrip('/')}/{folder['name']}"
             iid  = self._fb_tree.insert(
                 parent_iid, "end", text=folder["name"],
                 values=("",), open=False, tags=("dir", full))
             self._fb_tree.insert(iid, "end", text="loading…", tags=("placeholder",))
-
         for f in sorted(files, key=lambda e: e["name"].lower()):
             full    = f"{path.rstrip('/')}/{f['name']}"
             size_kb = f["size"] // 1024

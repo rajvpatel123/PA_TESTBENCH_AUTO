@@ -1,21 +1,16 @@
-# tabs/dmm_tab.py - COMPLETE FILE
+# tabs/dmm_tab.py
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import time
 import datetime
 from utils.logger import get_logger, session_logger
+from utils.visa_helper import find_all_drivers
 
 _logger = get_logger(__name__)
 
-DMM_INSTRUMENTS = [
-    {"name": "Keysight_34465A_1"},
-    {"name": "Keysight_34465A_2"},
-    {"name": "Keysight_34461A"},
-]
-
 POLL_INTERVAL_MS = 1000
-STALE_AFTER_S    = 5.0   # readings older than this are flagged stale
+STALE_AFTER_S    = 5.0
 
 
 class DMMTab(ttk.Frame):
@@ -30,6 +25,11 @@ class DMMTab(ttk.Frame):
 
     def set_driver_registry(self, registry: dict):
         self._registry = registry
+        self._refresh_dmm_rows()
+
+    def _discovered_dmms(self) -> list:
+        """Return list of (name, driver) for all DMMs found in the registry."""
+        return find_all_drivers(self._registry, role="dmm")
 
     def _build_ui(self):
         ttk.Label(self, text="Digital Multimeters",
@@ -73,6 +73,8 @@ class DMMTab(ttk.Frame):
         self.poll_btn.pack(side="left", padx=5)
         ttk.Button(ctrl_frame, text="Clear Readings",
                    command=self._clear_readings).pack(side="left", padx=5)
+        ttk.Button(ctrl_frame, text="↺ Refresh DMMs",
+                   command=self._refresh_dmm_rows).pack(side="left", padx=5)
 
         log_frame = ttk.LabelFrame(self, text="Reading Log")
         log_frame.pack(fill="both", expand=True, padx=15, pady=5)
@@ -89,17 +91,22 @@ class DMMTab(ttk.Frame):
                                      foreground="gray")
         self.status_lbl.pack(pady=5)
 
-        self._populate_rows()
+        self._refresh_dmm_rows()
 
-    def _populate_rows(self):
+    def _refresh_dmm_rows(self):
+        """Rebuild the DMM table from whatever the registry currently has."""
         self.tree.delete(*self.tree.get_children())
         self._rows.clear()
-        for dmm in DMM_INSTRUMENTS:
-            name = dmm["name"]
+        dmms = self._discovered_dmms()
+        if not dmms:
+            self.tree.insert("", "end", iid="__none__",
+                             values=("No DMMs detected", "—", "—", "—", "—", "—"))
+            return
+        for name, _drv in dmms:
             self._rows[name] = {
                 "mode":      "VOLT:DC",
-                "reading":   None,      # float or None
-                "timestamp": None,      # datetime or None
+                "reading":   None,
+                "timestamp": None,
             }
             self.tree.insert("", "end", iid=name,
                              values=(name, "VOLT:DC", "---", "V", "---", "Idle"))
@@ -107,10 +114,12 @@ class DMMTab(ttk.Frame):
     # ── Mode dialog ────────────────────────────────────────────
     def _on_row_double_click(self, event):
         sel = self.tree.selection()
-        if sel:
+        if sel and sel[0] != "__none__":
             self._open_mode_dialog(sel[0])
 
     def _open_mode_dialog(self, name: str):
+        if name not in self._rows:
+            return
         dialog = tk.Toplevel(self)
         dialog.title(f"Configure: {name}")
         dialog.grab_set()
@@ -146,7 +155,7 @@ class DMMTab(ttk.Frame):
     def _mode_unit(self, mode: str) -> str:
         return {"VOLT:DC": "V", "VOLT:AC": "V",
                 "CURR:DC": "A", "CURR:AC": "A",
-                "RES": "Ω"}.get(mode, "")
+                "RES": "\u03a9"}.get(mode, "")
 
     # ── Reading ────────────────────────────────────────────────
     def _read_once(self):
@@ -173,7 +182,6 @@ class DMMTab(ttk.Frame):
             unit  = self._mode_unit(mode)
             now   = datetime.datetime.now()
 
-            # Store reading + timestamp
             self._rows[name]["reading"]   = value
             self._rows[name]["timestamp"] = now
 
@@ -195,9 +203,8 @@ class DMMTab(ttk.Frame):
                 self._mode_unit(mode), "---", str(e)[:30]))
             _logger.error(f"DMM {name} read error: {e}")
 
-    # ── Age ticker — updates Age column every second ───────────
+    # ── Age ticker ─────────────────────────────────────────────
     def _tick_ages(self):
-        """Called every second to update the Age (s) column in the table."""
         now = datetime.datetime.now()
         for name, row in self._rows.items():
             ts = row.get("timestamp")
@@ -234,7 +241,7 @@ class DMMTab(ttk.Frame):
             self._poll_thread = threading.Thread(
                 target=self._poll_loop, args=(interval_ms,), daemon=True)
             self._poll_thread.start()
-            self._tick_ages()   # start the age ticker
+            self._tick_ages()
 
     def _poll_loop(self, interval_ms: int):
         while self._polling:
@@ -270,27 +277,13 @@ class DMMTab(ttk.Frame):
 
     # ── Sequencer API ──────────────────────────────────────────
     def get_latest_readings(self, max_age_s: float = STALE_AFTER_S) -> dict:
-        """
-        Return latest readings for sequencer PAE calculation.
-
-        Each entry:
-            {
-                "mode":    str,
-                "reading": str,        # display string from tree
-                "unit":    str,
-                "value":   float|None, # raw float, None if no reading yet
-                "stale":   bool,       # True if older than max_age_s
-            }
-
-        The sequencer should check stale=True and skip PAE if so.
-        """
-        now      = datetime.datetime.now()
-        result   = {}
+        now    = datetime.datetime.now()
+        result = {}
         for name, row in self._rows.items():
-            ts      = row.get("timestamp")
-            value   = row.get("reading")
-            vals    = self.tree.item(name, "values")
-            stale   = True
+            ts    = row.get("timestamp")
+            value = row.get("reading")
+            vals  = self.tree.item(name, "values")
+            stale = True
             if ts is not None:
                 age_s = (now - ts).total_seconds()
                 stale = age_s > max_age_s

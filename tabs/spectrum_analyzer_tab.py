@@ -1,15 +1,14 @@
-# tabs/spectrum_analyzer_tab.py - COMPLETE FILE
+# tabs/spectrum_analyzer_tab.py
 import tkinter as tk
 from tkinter import ttk, messagebox
 from utils.logger import get_logger
 from utils.freq_entry import FreqEntry
+from utils.visa_helper import find_driver
 
 _logger = get_logger(__name__)
 
 
 class SpectrumAnalyzerTab(ttk.Frame):
-
-    DRIVER_NAME = "PXA_N9030A"
 
     def __init__(self, parent, driver_registry: dict):
         super().__init__(parent)
@@ -24,21 +23,22 @@ class SpectrumAnalyzerTab(ttk.Frame):
         self._registry = registry
 
     def _get_driver(self):
-        drv = self._registry.get(self.DRIVER_NAME)
+        """Find the spectrum analyzer using role-based fuzzy lookup."""
+        drv = find_driver(self._registry, role="specan")
         if drv is None:
-            messagebox.showerror("Not Connected",
-                                 f"{self.DRIVER_NAME} not connected.\n"
-                                 "Go to Device Manager and click Connect All.")
+            messagebox.showerror(
+                "Not Connected",
+                "No Spectrum Analyzer found in auto-discovered instruments.\n"
+                "Ensure the PXA N9030A (or compatible) is powered on and connected via VISA.")
         return drv
 
     def _build_ui(self):
-        ttk.Label(self, text="Spectrum Analyzer - Keysight PXA N9030A",
+        ttk.Label(self, text="Spectrum Analyzer",
                   font=("Segoe UI", 14, "bold")).pack(pady=10)
 
         main = ttk.Frame(self)
         main.pack(fill="both", expand=True, padx=15, pady=5)
 
-        # ── LEFT: Settings ─────────────────────────────────────
         left = ttk.LabelFrame(main, text="Analyzer Settings")
         left.pack(side="left", fill="both", expand=False, padx=(0, 10))
 
@@ -51,7 +51,6 @@ class SpectrumAnalyzerTab(ttk.Frame):
                       row=row, column=0, padx=8, pady=6, sticky="e")
 
         def add_plain_row(row, label, var, unit=""):
-            """For non-frequency fields (ref level, acq window)."""
             ttk.Label(settings_grid, text=label,
                       width=20, anchor="e").grid(
                       row=row, column=0, padx=8, pady=6, sticky="e")
@@ -61,7 +60,6 @@ class SpectrumAnalyzerTab(ttk.Frame):
                 ttk.Label(settings_grid, text=unit).grid(
                     row=row, column=2, sticky="w")
 
-        # FreqEntry rows
         add_label(0, "Center Frequency:")
         self.center_fe = FreqEntry(settings_grid, width=12, default_unit="MHz")
         self.center_fe.grid(row=0, column=1, columnspan=2, padx=5, pady=6, sticky="w")
@@ -78,7 +76,6 @@ class SpectrumAnalyzerTab(ttk.Frame):
         self.vbw_fe = FreqEntry(settings_grid, width=12, default_unit="kHz")
         self.vbw_fe.grid(row=3, column=1, columnspan=2, padx=5, pady=6, sticky="w")
 
-        # Plain entry rows
         self.ref_var = tk.StringVar(value="")
         self.acq_var = tk.StringVar(value="")
         add_plain_row(4, "Reference Level:", self.ref_var, "dBm")
@@ -89,7 +86,6 @@ class SpectrumAnalyzerTab(ttk.Frame):
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", padx=10, pady=5)
 
-        # Trigger
         trig_frame = ttk.LabelFrame(left, text="Trigger")
         trig_frame.pack(fill="x", padx=10, pady=5)
         ttk.Button(trig_frame, text="Single Sweep",
@@ -101,7 +97,6 @@ class SpectrumAnalyzerTab(ttk.Frame):
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", padx=10, pady=5)
 
-        # Presets
         preset_frame = ttk.LabelFrame(left, text="Quick Presets")
         preset_frame.pack(fill="x", padx=10, pady=5)
         ttk.Button(preset_frame, text="1 GHz / 100 MHz span",
@@ -114,13 +109,11 @@ class SpectrumAnalyzerTab(ttk.Frame):
                    command=lambda: self._apply_preset(5.8e9, 500e6)).pack(
                    fill="x", padx=5, pady=3)
 
-        # ── RIGHT: Trace plot ──────────────────────────────────
         right = ttk.LabelFrame(main, text="Trace")
         right.pack(side="right", fill="both", expand=True)
 
         try:
             import matplotlib
-            #matplotlib.use("TkAgg")
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_tkagg import (
                 FigureCanvasTkAgg, NavigationToolbar2Tk)
@@ -144,7 +137,6 @@ class SpectrumAnalyzerTab(ttk.Frame):
                       text="Install matplotlib for live plots.\n(pip install matplotlib)",
                       foreground="gray").pack(expand=True)
 
-        # Plot controls
         plot_btn_frame = ttk.Frame(right)
         plot_btn_frame.pack(fill="x", padx=5, pady=4)
 
@@ -178,19 +170,16 @@ class SpectrumAnalyzerTab(ttk.Frame):
         drv = self._get_driver()
         if drv is None:
             return
-
         center_hz = self.center_fe.get_hz()
         span_hz   = self.span_fe.get_hz()
         rbw_hz    = self.rbw_fe.get_hz()
         vbw_hz    = self.vbw_fe.get_hz()
-
         try:
             ref_raw = self.ref_var.get().strip()
             ref_val = float(ref_raw) if ref_raw else None
         except ValueError:
             messagebox.showerror("Invalid Input", "Reference Level must be a number.")
             return
-
         try:
             if center_hz is not None: drv.set_center(center_hz)
             if span_hz   is not None: drv.set_span(span_hz)
@@ -273,12 +262,13 @@ class SpectrumAnalyzerTab(ttk.Frame):
 
     # ── Trace ──────────────────────────────────────────────────
     def _refresh_trace(self):
-        drv = self._registry.get(self.DRIVER_NAME)
+        drv = find_driver(self._registry, role="specan")
         if drv is None:
             if not self._live_polling:
-                messagebox.showerror("Not Connected",
-                                     f"{self.DRIVER_NAME} not connected.\n"
-                                     "Go to Device Manager and click Connect All.")
+                messagebox.showerror(
+                    "Not Connected",
+                    "No Spectrum Analyzer found.\n"
+                    "Ensure the instrument is powered on and connected via VISA.")
             return
         try:
             trace = drv.acquire_trace()
@@ -288,15 +278,12 @@ class SpectrumAnalyzerTab(ttk.Frame):
                 self._ax.set_title("Spectrum Trace")
                 self._ax.set_ylabel("Amplitude (dBm)")
                 self._ax.grid(True)
-
                 if isinstance(trace[0], (list, tuple)):
                     freqs_raw = [p[0] for p in trace]
                     amps      = [p[1] for p in trace]
                 else:
                     freqs_raw = list(range(len(trace)))
                     amps      = trace
-
-                # Auto-scale freq axis to best unit for display
                 max_hz = max(freqs_raw) if freqs_raw else 1
                 if max_hz >= 1e9:
                     freqs_disp = [f / 1e9 for f in freqs_raw]
@@ -310,10 +297,8 @@ class SpectrumAnalyzerTab(ttk.Frame):
                 else:
                     freqs_disp = freqs_raw
                     self._ax.set_xlabel("Frequency (Hz)")
-
                 self._ax.plot(freqs_disp, amps, color="cyan", linewidth=1)
                 self._plot_canvas.draw()
-
             self.status_lbl.config(
                 text=f"Status: Trace captured ({len(trace)} points)",
                 foreground="green")
@@ -361,7 +346,7 @@ class SpectrumAnalyzerTab(ttk.Frame):
             messagebox.showerror("Save Error", str(e))
             _logger.error(f"SpecAn trace save failed: {e}")
 
-    # ── get_settings / load_settings (sequencer + profiles) ───
+    # ── get_settings / load_settings ──────────────────────────
     def get_settings(self) -> dict:
         return {
             "center_hz":    self.center_fe.get_hz(),
