@@ -11,7 +11,7 @@ Auto-discovers all connected VISA instruments by:
 No hardcoded GPIB addresses or USB IDs required.
 """
 
-import pyvisa
+from utils.visa_manager import get_visa_rm  # no circular dep - visa_manager imports nothing from here
 from utils.logger import get_logger
 
 from drivers import (
@@ -24,9 +24,8 @@ from drivers import (
 )
 
 _logger = get_logger(__name__)
-_rm = None  # singleton ResourceManager
 
-# ── IDN-to-driver map ─────────────────────────────────────────────────────────
+# ── IDN-to-driver map ─────────────────────────────────────────────────────
 # Each entry: (list of IDN substrings to match, driver class)
 # Matching is case-insensitive. First match wins.
 _IDN_MAP = [
@@ -52,15 +51,6 @@ _ROLE_HINTS = {
 }
 
 
-def get_visa_rm() -> pyvisa.ResourceManager:
-    """Return a singleton pyvisa ResourceManager."""
-    global _rm
-    if _rm is None:
-        _rm = pyvisa.ResourceManager()
-        _logger.info("Initialized VISA ResourceManager")
-    return _rm
-
-
 def _match_idn(idn: str):
     """
     Given a raw *IDN? response string, return the matching driver class
@@ -77,24 +67,21 @@ def _match_idn(idn: str):
 def _make_registry_name(idn: str, addr: str) -> str:
     """
     Build a human-readable registry key from the IDN response and address.
-    Example: 'Agilent_E3648A_GPIB10'  or  'Keysight_E36234A_USB0'
+    Example: 'Agilent_E3648A_GPIB10'  or  'Keysight_E36234A_USB'
     """
-    # Pull model token from IDN (field index 1: manufacturer,model,serial,fw)
-    parts = [p.strip() for p in idn.split(",")]
+    parts        = [p.strip() for p in idn.split(",")]
     manufacturer = parts[0] if len(parts) > 0 else "Unknown"
     model        = parts[1] if len(parts) > 1 else "Device"
 
-    # Shorten manufacturer names
     mfr_map = {
-        "agilent":       "Agilent",
-        "keysight":      "Keysight",
+        "agilent":         "Agilent",
+        "keysight":        "Keysight",
         "hewlett-packard": "HP",
-        "rohde&schwarz": "RS",
+        "rohde&schwarz":   "RS",
         "rohde & schwarz": "RS",
     }
     mfr_short = mfr_map.get(manufacturer.lower(), manufacturer.split()[0])
 
-    # Pull a short address tag (e.g. GPIB0::15 -> GPIB15, USB... -> USB)
     if "GPIB" in addr.upper():
         import re
         m = re.search(r"GPIB\d+::(\d+)", addr, re.IGNORECASE)
@@ -107,19 +94,34 @@ def _make_registry_name(idn: str, addr: str) -> str:
     return f"{mfr_short}_{model}_{addr_tag}"
 
 
+def load_driver(address: str):
+    """
+    Open a raw VISA resource, send *IDN?, match to a driver class,
+    and return an unconnected driver instance.
+    Raises if the address is unreachable or IDN doesn't match any driver.
+    """
+    rm  = get_visa_rm()
+    res = rm.open_resource(address)
+    res.timeout = 3000
+    try:
+        idn = res.query("*IDN?").strip()
+    finally:
+        try: res.close()
+        except Exception: pass
+
+    driver_cls = _match_idn(idn)
+    if driver_cls is None:
+        raise ValueError(f"No driver match for IDN: '{idn}' at {address}")
+    return driver_cls(address)
+
+
 def discover_instruments(timeout_ms: int = 2000) -> dict:
     """
     Scan all VISA resources, query *IDN?, match to a driver, connect, and
     return a registry dict {name: driver_instance}.
 
     Instruments that don't respond or don't match any driver are skipped
-    with a warning log — they never raise.
-
-    Args:
-        timeout_ms: VISA timeout in ms for the IDN query (default 2000).
-
-    Returns:
-        dict mapping auto-generated name -> connected driver instance.
+    with a warning log.
     """
     rm       = get_visa_rm()
     registry = {}
@@ -146,7 +148,6 @@ def discover_instruments(timeout_ms: int = 2000) -> dict:
                 except Exception: pass
             continue
 
-        # Close the raw resource — the driver will open its own session
         try: res.close()
         except Exception: pass
 
@@ -157,7 +158,6 @@ def discover_instruments(timeout_ms: int = 2000) -> dict:
 
         name = _make_registry_name(idn, addr)
 
-        # Deduplicate: append _2, _3 etc. if name already taken
         base_name = name
         counter   = 2
         while name in registry:
