@@ -1,10 +1,11 @@
 # tabs/device_info_tab.py
 import tkinter as tk
 from tkinter import ttk, messagebox
+import threading
 import json
 import os
 from utils.logger import get_logger
-from utils.visa_helper import load_driver
+from utils.visa_helper import discover_instruments, load_driver, find_driver, get_visa_rm
 from utils.ui_theme import (
     APP_COLORS,
     apply_zebra_tags,
@@ -17,18 +18,15 @@ _logger = get_logger(__name__)
 
 ALIASES_FILE = "instrument_aliases.json"
 
-COMPANY_INSTRUMENTS = [
-    {"name": "Keysight_E36234A_90",      "address": "USB0::0x2A8D::0x3402::MY61002290::INSTR", "role": "Power Supply"},
-    {"name": "Keysight_E36233A_32",      "address": "USB0::0x2A8D::0x3302::MY61003932::INSTR", "role": "Power Supply"},
-    {"name": "Agilent_E3648A_GPIB15", "address": "GPIB0::15::INSTR",                        "role": "Power Supply"},
-    {"name": "Agilent_E3648A_GPIB11", "address": "GPIB0::11::INSTR",                        "role": "Power Supply"},
-    {"name": "Agilent_3648A",         "address": "GPIB0::10::INSTR",                        "role": "Power Supply"},
-    {"name": "Keysight_34465A_1",     "address": "USB0::0x2A8D::0x0101::MY60050792::INSTR", "role": "DMM"},
-    {"name": "Keysight_34465A_2",     "address": "USB0::0x2A8D::0x0101::MY59001442::INSTR", "role": "DMM"},
-    {"name": "Keysight_34461A",       "address": "USB0::0x2A8D::0x1301::MY57206934::0::INSTR", "role": "DMM"},
-    {"name": "PXA_N9030A",            "address": "GPIB0::18::INSTR",                        "role": "Spectrum Analyzer"},
-    {"name": "RS_SMBV100B",           "address": "GPIB0::28::INSTR",                        "role": "Signal Generator"},
-]
+# Role is inferred from the driver class name at connect-time
+_CLASS_ROLE_MAP = {
+    "KeysightE36xxSupply":  "Power Supply",
+    "AgilentE3648ASupply":  "Power Supply",
+    "HP6633BSupply":        "Power Supply",
+    "Keysight3446xDMM":     "DMM",
+    "PXAN9030A":            "Spectrum Analyzer",
+    "RSSMBV100B":           "Signal Generator",
+}
 
 
 class DeviceInfoTab(ttk.Frame):
@@ -39,9 +37,9 @@ class DeviceInfoTab(ttk.Frame):
         self._driver_update_callback = None
         self._driver_registry        = {}
         self._alias_map              = self._load_aliases()
+        self._scanning               = False
 
         self._build_ui()
-        self._populate_devices()
 
     def set_driver_update_callback(self, callback):
         self._driver_update_callback = callback
@@ -78,17 +76,16 @@ class DeviceInfoTab(ttk.Frame):
         make_header(
             self,
             "Device Manager",
-            "Connect instruments, verify communication, and manage friendly aliases.",
+            "Auto-discover instruments via VISA, verify communication, and manage aliases.",
         )
 
         top_shell = ttk.Frame(self)
         top_shell.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        # Main content split
         content = ttk.Frame(top_shell)
         content.pack(fill="both", expand=True)
 
-        left  = ttk.Frame(content)
+        left = ttk.Frame(content)
         left.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
         right = ttk.LabelFrame(content, text="Selected Device",
@@ -96,14 +93,17 @@ class DeviceInfoTab(ttk.Frame):
         right.pack(side="right", fill="y")
         right.configure(padding=12)
 
-        # Toolbar
+        # ── Toolbar ────────────────────────────────────────────
         toolbar = ttk.Frame(left, style="Panel.TFrame")
         toolbar.pack(fill="x", pady=(0, 8))
         toolbar.configure(padding=10)
 
-        ttk.Button(toolbar, text="Connect All",
-                   command=self._connect_all,
-                   style="Primary.TButton").pack(side="left", padx=(0, 8))
+        self.scan_btn = ttk.Button(
+            toolbar, text="Scan & Connect All",
+            command=self._start_scan,
+            style="Primary.TButton")
+        self.scan_btn.pack(side="left", padx=(0, 8))
+
         ttk.Button(toolbar, text="Reconnect Selected",
                    command=self._reconnect_selected).pack(side="left", padx=4)
         ttk.Button(toolbar, text="Self-Test",
@@ -112,10 +112,12 @@ class DeviceInfoTab(ttk.Frame):
                    command=self._reset_selected).pack(side="left", padx=4)
         ttk.Button(toolbar, text="Edit Alias",
                    command=self._edit_alias).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="Add Manual",
+                   command=self._add_manual).pack(side="left", padx=4)
         ttk.Button(toolbar, text="Clear List",
                    command=self._clear_list).pack(side="left", padx=4)
 
-        # Table panel
+        # ── Table ──────────────────────────────────────────────
         table_panel = ttk.Frame(left, style="Panel.TFrame")
         table_panel.pack(fill="both", expand=True)
         table_panel.configure(padding=10)
@@ -126,7 +128,7 @@ class DeviceInfoTab(ttk.Frame):
 
         col_widths = {
             "Name":    180, "Alias": 140, "Role":   130,
-            "Address": 250, "IDN":   260, "Driver": 140, "Status": 120,
+            "Address": 250, "IDN":   260, "Driver": 160, "Status": 130,
         }
         for col in cols:
             self.tree.heading(col, text=col)
@@ -146,16 +148,17 @@ class DeviceInfoTab(ttk.Frame):
 
         ttk.Label(
             left,
-            text="Tip: Select a device to see details and actions on the right.",
+            text="Tip: Click 'Scan & Connect All' to auto-discover all VISA instruments.  "
+                 "Use 'Add Manual' to force-add a custom address.",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(6, 0))
 
-        # Right-side details panel
+        # ── Right detail panel ─────────────────────────────────
         self.detail_name    = tk.StringVar(value="No device selected")
-        self.detail_alias   = tk.StringVar(value="—")
-        self.detail_role    = tk.StringVar(value="—")
-        self.detail_address = tk.StringVar(value="—")
-        self.detail_driver  = tk.StringVar(value="—")
+        self.detail_alias   = tk.StringVar(value="\u2014")
+        self.detail_role    = tk.StringVar(value="\u2014")
+        self.detail_address = tk.StringVar(value="\u2014")
+        self.detail_driver  = tk.StringVar(value="\u2014")
         self.detail_status  = tk.StringVar(value="Idle")
 
         ttk.Label(right, textvariable=self.detail_name,
@@ -182,7 +185,7 @@ class DeviceInfoTab(ttk.Frame):
         ttk.Button(right, text="Edit Alias",
                    command=self._edit_alias).pack(fill="x", pady=4)
 
-        self.status_lbl = ttk.Label(self, text="Status: Ready",
+        self.status_lbl = ttk.Label(self, text="Status: Ready — click Scan & Connect All",
                                      foreground=APP_COLORS["muted"])
         self.status_lbl.pack(anchor="w", padx=12, pady=(0, 12))
 
@@ -200,21 +203,199 @@ class DeviceInfoTab(ttk.Frame):
             justify="left",
         ).pack(side="left", fill="x", expand=True)
 
-    # ── Populate table ─────────────────────────────────────────
-    def _populate_devices(self):
+    # ── Auto-discovery (threaded) ──────────────────────────────
+    def _start_scan(self):
+        if self._scanning:
+            return
+        self._scanning = True
+        self.scan_btn.config(text="Scanning...", state="disabled")
+        set_status_label(self.status_lbl,
+                         "Status: Scanning VISA bus — please wait...", "info")
         self.tree.delete(*self.tree.get_children())
-        for i, inst in enumerate(COMPANY_INSTRUMENTS):
-            alias = self._alias_map.get(inst["name"], "")
-            self.tree.insert(
-                "", "end", iid=inst["name"],
-                values=(
-                    inst["name"], alias, inst["role"],
-                    inst["address"], "", "", "Not Connected",
-                ),
-                tags=("even" if i % 2 else "odd",),
-            )
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        """Runs on a background thread — calls discover_instruments()."""
+        try:
+            registry = discover_instruments(timeout_ms=2000)
+        except Exception as e:
+            _logger.error(f"Discovery failed: {e}")
+            registry = {}
+        # Hand results back to the Tk main thread
+        self.after(0, lambda: self._scan_done(registry))
+
+    def _scan_done(self, registry: dict):
+        """Called on the main thread after discovery finishes."""
+        self._scanning = False
+        self.scan_btn.config(text="Scan & Connect All", state="normal")
+
+        # Merge newly discovered drivers into the registry,
+        # preserving any manually-added entries already there.
+        self._driver_registry.update(registry)
+
+        self.tree.delete(*self.tree.get_children())
+        for i, (name, drv) in enumerate(self._driver_registry.items()):
+            self._insert_row(i, name, drv)
+
         apply_zebra_tags(self.tree)
+
+        n = len(registry)
+        tone = "success" if n > 0 else "warning"
+        set_status_label(
+            self.status_lbl,
+            f"Status: Scan complete — {n} instrument(s) found",
+            tone,
+        )
+        _logger.info(f"Scan complete: {n} instrument(s)")
         self._notify_driver_update()
+
+    def _insert_row(self, index: int, name: str, drv):
+        """Insert or refresh one row in the tree from a live driver object."""
+        alias       = self._alias_map.get(name, "")
+        driver_name = drv.__class__.__name__
+        role        = _CLASS_ROLE_MAP.get(driver_name, "Unknown")
+        address     = getattr(drv, "_address", "") or getattr(drv, "address", "")
+
+        # Try to get IDN from the live instrument
+        idn = ""
+        try:
+            if hasattr(drv, "_inst") and drv._inst:
+                idn = drv._inst.query("*IDN?").strip()
+            elif hasattr(drv, "query"):
+                idn = drv.query("*IDN?").strip()
+        except Exception:
+            idn = "(connected)"
+
+        tag = "even" if index % 2 else "odd"
+        self.tree.insert(
+            "", "end", iid=name,
+            values=(name, alias, role, address, idn, driver_name, "Connected"),
+            tags=(tag,),
+        )
+
+    # ── Manual add ─────────────────────────────────────────────
+    def _add_manual(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Add Instrument Manually")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="VISA Address:",
+                  font=("Segoe UI", 10, "bold")).grid(
+                  row=0, column=0, padx=12, pady=(14, 4), sticky="e")
+        addr_var = tk.StringVar(value="GPIB0::XX::INSTR")
+        ttk.Entry(dialog, textvariable=addr_var, width=36).grid(
+            row=0, column=1, padx=10, pady=(14, 4))
+
+        ttk.Label(dialog,
+                  text="Enter the full VISA resource string.\n"
+                       "e.g.  GPIB0::15::INSTR  or  USB0::0x2A8D::0x3402::MY61002290::INSTR",
+                  foreground=APP_COLORS["muted"], justify="left").grid(
+                  row=1, column=0, columnspan=2, padx=12, pady=(0, 8))
+
+        def connect():
+            addr = addr_var.get().strip()
+            if not addr:
+                messagebox.showwarning("Missing Address",
+                                       "Enter a VISA address.", parent=dialog)
+                return
+            dialog.destroy()
+            self._connect_manual(addr)
+
+        ttk.Button(dialog, text="Connect",
+                   command=connect,
+                   style="Primary.TButton").grid(
+                   row=2, column=0, columnspan=2, pady=12)
+
+    def _connect_manual(self, addr: str):
+        set_status_label(self.status_lbl,
+                         f"Status: Connecting to {addr}...", "info")
+        try:
+            drv = load_driver(addr)
+            drv.connect()
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"{addr}:\n{e}")
+            set_status_label(self.status_lbl,
+                             f"Status: Failed to connect {addr}", "danger")
+            _logger.error(f"Manual connect failed for {addr}: {e}")
+            return
+
+        # Build registry name from IDN
+        from utils.visa_helper import _make_registry_name
+        idn = "(unknown)"
+        try:
+            if hasattr(drv, "_inst") and drv._inst:
+                idn = drv._inst.query("*IDN?").strip()
+        except Exception:
+            pass
+
+        name = _make_registry_name(idn, addr)
+        base, counter = name, 2
+        while name in self._driver_registry:
+            name = f"{base}_{counter}"
+            counter += 1
+
+        self._driver_registry[name] = drv
+
+        # Insert row if not already in tree
+        existing = [self.tree.item(i, "values")[0]
+                    for i in self.tree.get_children()]
+        if name not in existing:
+            idx = len(self.tree.get_children())
+            self._insert_row(idx, name, drv)
+            apply_zebra_tags(self.tree)
+
+        set_status_label(self.status_lbl,
+                         f"Status: Manually connected '{name}'", "success")
+        _logger.info(f"Manual connect: '{name}' @ {addr}")
+        self._notify_driver_update()
+
+    # ── Reconnect selected ─────────────────────────────────────
+    def _reconnect_selected(self):
+        item_id = self._get_selected_item_id()
+        if not item_id:
+            return
+        vals    = self.tree.item(item_id, "values")
+        address = vals[3]
+        if not address:
+            messagebox.showerror("No Address",
+                                 "No VISA address stored for this device.")
+            return
+        set_status_label(self.status_lbl,
+                         f"Status: Reconnecting {item_id}...", "info")
+        try:
+            drv = load_driver(address)
+            drv.connect()
+            self._driver_registry[item_id] = drv
+
+            idn = ""
+            try:
+                if hasattr(drv, "_inst") and drv._inst:
+                    idn = drv._inst.query("*IDN?").strip()
+            except Exception:
+                idn = "(connected)"
+
+            new_vals    = list(vals)
+            new_vals[4] = idn
+            new_vals[5] = drv.__class__.__name__
+            new_vals[6] = "Connected"
+            self.tree.item(item_id, values=new_vals, tags=("status_ok",))
+            apply_zebra_tags(self.tree)
+            self._on_tree_select()
+            set_status_label(self.status_lbl,
+                             f"Status: Reconnected '{item_id}'", "success")
+            _logger.info(f"Reconnected: {item_id} @ {address}")
+            self._notify_driver_update()
+        except Exception as e:
+            new_vals    = list(vals)
+            new_vals[6] = "Connect Error"
+            self.tree.item(item_id, values=new_vals, tags=("status_err",))
+            apply_zebra_tags(self.tree)
+            set_status_label(self.status_lbl,
+                             f"Status: Reconnect failed — {item_id}", "danger")
+            messagebox.showerror("Connection Error", f"{item_id}:\n{e}")
+            _logger.error(f"Reconnect failed for {item_id}: {e}")
+            self._notify_driver_update()
 
     # ── Selection helpers ──────────────────────────────────────
     def _get_selected_item_id(self):
@@ -234,10 +415,10 @@ class DeviceInfoTab(ttk.Frame):
             return
         vals = self.tree.item(item_id, "values")
         self.detail_name.set(vals[0])
-        self.detail_alias.set(vals[1] or "—")
+        self.detail_alias.set(vals[1] or "\u2014")
         self.detail_role.set(vals[2])
         self.detail_address.set(vals[3])
-        self.detail_driver.set(vals[5] or "—")
+        self.detail_driver.set(vals[5] or "\u2014")
         self.detail_status.set(vals[6] or "Idle")
 
         tone        = "muted"
@@ -249,78 +430,6 @@ class DeviceInfoTab(ttk.Frame):
         elif "not connected" in status_text:
             tone = "warning"
         set_status_label(self._detail_status_lbl, vals[6] or "Idle", tone)
-
-    def _find_company_instrument(self, name: str):
-        for inst in COMPANY_INSTRUMENTS:
-            if inst["name"] == name:
-                return inst
-        return None
-
-    # ── Connect / reconnect ────────────────────────────────────
-    def _connect_all(self):
-        connected = failed = 0
-        for inst in COMPANY_INSTRUMENTS:
-            if self._connect_one(inst["name"], silent=True):
-                connected += 1
-            else:
-                failed += 1
-        tone = "success" if failed == 0 else "warning"
-        set_status_label(
-            self.status_lbl,
-            f"Status: Connected {connected} device(s), {failed} issue(s)",
-            tone,
-        )
-
-    def _reconnect_selected(self):
-        item_id = self._get_selected_item_id()
-        if not item_id:
-            return
-        ok = self._connect_one(item_id, silent=False)
-        if ok:
-            self._on_tree_select()
-
-    def _connect_one(self, name: str, silent: bool = False):
-        inst = self._find_company_instrument(name)
-        if not inst:
-            if not silent:
-                messagebox.showerror("Missing Device",
-                                     f"No config found for {name}.")
-            return False
-        try:
-            drv         = load_driver(inst["address"])
-            self._driver_registry[inst["name"]] = drv
-            driver_name = drv.__class__.__name__
-            idn         = ""
-            try:
-                if hasattr(drv, "query"):
-                    idn = drv.query("*IDN?").strip()
-                elif hasattr(drv, "_inst"):
-                    idn = drv._inst.query("*IDN?").strip()
-            except Exception:
-                idn = "(connected)"
-
-            vals       = list(self.tree.item(inst["name"], "values"))
-            vals[4]    = idn
-            vals[5]    = driver_name
-            vals[6]    = "Connected"
-            self.tree.item(inst["name"], values=vals, tags=("status_ok",))
-            apply_zebra_tags(self.tree)
-            _logger.info(f"Connected: {inst['name']} @ {inst['address']}")
-            self._notify_driver_update()
-            return True
-
-        except Exception as e:
-            vals    = list(self.tree.item(inst["name"], "values"))
-            vals[4] = vals[5] = ""
-            vals[6] = "Connect Error"
-            self.tree.item(inst["name"], values=vals, tags=("status_err",))
-            apply_zebra_tags(self.tree)
-            _logger.error(f"Connect failed for {inst['name']}: {e}")
-            if not silent:
-                messagebox.showerror("Connection Error",
-                                     f"{inst['name']}:\n{e}")
-            self._notify_driver_update()
-            return False
 
     # ── Alias editing ──────────────────────────────────────────
     def _edit_alias(self):
@@ -346,8 +455,7 @@ class DeviceInfoTab(ttk.Frame):
             row=1, column=1, padx=10, pady=8)
         ttk.Label(
             dialog,
-            text="Alias is a friendly label only.\n"
-                 "The registry key stays the same.",
+            text="Alias is a friendly label only.\nThe registry key stays the same.",
             foreground=APP_COLORS["muted"], justify="left",
         ).grid(row=2, column=0, columnspan=2, padx=12, pady=4)
 
@@ -358,7 +466,7 @@ class DeviceInfoTab(ttk.Frame):
             new_vals    = list(vals)
             new_vals[1] = alias
             self.tree.item(item_id, values=new_vals)
-            _logger.info(f"Alias set: {name} → '{alias}'")
+            _logger.info(f"Alias set: {name} -> '{alias}'")
             self._on_tree_select()
             dialog.destroy()
 
@@ -389,19 +497,17 @@ class DeviceInfoTab(ttk.Frame):
         name = vals[0]
         drv  = self._driver_registry.get(name)
         if drv is None:
-            messagebox.showerror("Not Connected",
-                                 f"{name} is not connected.")
+            messagebox.showerror("Not Connected", f"{name} is not connected.")
             return
         try:
             result = drv._inst.query("*TST?").strip()
             if result == "0":
-                msg  = f"{name} self-test PASSED (result: {result})"
+                msg = f"{name} self-test PASSED (result: {result})"
                 self._set_row_status(item_id, vals, "Self-Test OK", "ok")
                 messagebox.showinfo("Self-Test Passed", msg)
             else:
-                msg  = f"{name} self-test FAILED (result: {result})"
-                self._set_row_status(
-                    item_id, vals, f"Self-Test FAIL ({result})", "err")
+                msg = f"{name} self-test FAILED (result: {result})"
+                self._set_row_status(item_id, vals, f"Self-Test FAIL ({result})", "err")
                 messagebox.showwarning("Self-Test Failed", msg)
             set_status_label(self.status_lbl, f"Status: {msg}", "info")
             _logger.info(msg)
@@ -419,13 +525,11 @@ class DeviceInfoTab(ttk.Frame):
         name = vals[0]
         drv  = self._driver_registry.get(name)
         if drv is None:
-            messagebox.showerror("Not Connected",
-                                 f"{name} is not connected.")
+            messagebox.showerror("Not Connected", f"{name} is not connected.")
             return
         if not messagebox.askyesno(
                 "Confirm Reset",
-                f"Send *RST to {name}?\n"
-                "This resets the instrument to factory defaults."):
+                f"Send *RST to {name}?\nThis resets the instrument to factory defaults."):
             return
         try:
             drv._inst.write("*RST")
@@ -444,7 +548,7 @@ class DeviceInfoTab(ttk.Frame):
         new_vals    = list(vals)
         new_vals[6] = status
         tags        = []
-        if tone == "ok":   tags.append("status_ok")
+        if tone == "ok":    tags.append("status_ok")
         elif tone == "err": tags.append("status_err")
         elif tone == "warn": tags.append("status_warn")
         self.tree.item(item_id, values=new_vals, tags=tuple(tags))
